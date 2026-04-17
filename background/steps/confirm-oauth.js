@@ -126,7 +126,8 @@
               if (pageState?.addPhonePage) {
                 const latestState = await getState();
                 await resolveStep8PhoneVerificationFlow(latestState, pageState);
-                return;
+                await addLog('步骤 8：手机号验证已完成，继续执行 OAuth 授权确认...', 'info');
+                continue;
               }
               if (!pageState?.consentReady) {
                 await sleepWithStop(STEP8_CLICK_RETRY_DELAY_MS);
@@ -158,7 +159,8 @@
               if (latestAuthState?.addPhonePage) {
                 const latestState = await getState();
                 await resolveStep8PhoneVerificationFlow(latestState, latestAuthState);
-                return;
+                await addLog('步骤 8：手机号验证已完成，继续执行 OAuth 授权确认...', 'info');
+                continue;
               }
 
               if (effect.progressed) {

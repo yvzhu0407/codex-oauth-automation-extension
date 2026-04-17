@@ -1027,6 +1027,50 @@ async function fillAddPhoneNumber(payload = {}) {
   return await waitForAddPhoneNumberSubmitOutcome(nationalNumber);
 }
 
+async function waitForAddPhoneCodeSubmitOutcome(timeout = 15000) {
+  const start = Date.now();
+
+  while (Date.now() - start < timeout) {
+    throwIfStopped();
+
+    const errorText = findAddPhoneErrorText();
+    if (errorText) {
+      if (isPhoneMaxUsageExceededError(errorText)) {
+        return {
+          invalidPhone: true,
+          retryWithAnotherPhone: true,
+          errorText,
+        };
+      }
+      return { invalidCode: true, errorText };
+    }
+
+    if (isStep8Ready()) {
+      return { success: true, consentReady: true };
+    }
+
+    if (!isAddPhonePageReady()) {
+      return { success: true };
+    }
+
+    await sleep(150);
+  }
+
+  const finalErrorText = findAddPhoneErrorText();
+  if (finalErrorText) {
+    if (isPhoneMaxUsageExceededError(finalErrorText)) {
+      return {
+        invalidPhone: true,
+        retryWithAnotherPhone: true,
+        errorText: finalErrorText,
+      };
+    }
+    return { invalidCode: true, errorText: finalErrorText };
+  }
+
+  return { invalidCode: true, errorText: '提交短信验证码后页面未继续前进。' };
+}
+
 async function fillAddPhoneVerificationCode(payload = {}) {
   const code = String(payload.code || '').trim();
   if (!code) {
@@ -1041,7 +1085,14 @@ async function fillAddPhoneVerificationCode(payload = {}) {
         await humanPause(80, 180);
         fillInput(splitInputs[i], code[i]);
       }
-      return { success: true };
+
+      const splitSubmitBtn = findAddPhoneSubmitButton({ allowDisabled: true });
+      if (splitSubmitBtn && isActionEnabled(splitSubmitBtn)) {
+        await humanPause(250, 650);
+        simulateClick(splitSubmitBtn);
+      }
+
+      return await waitForAddPhoneCodeSubmitOutcome();
     }
     throw new Error('未找到手机验证码输入框。URL: ' + location.href);
   }
@@ -1055,7 +1106,7 @@ async function fillAddPhoneVerificationCode(payload = {}) {
     simulateClick(submitBtn);
   }
 
-  return { success: true };
+  return await waitForAddPhoneCodeSubmitOutcome();
 }
 
 function isStep8Ready() {
