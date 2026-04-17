@@ -9,6 +9,7 @@
       clickWithDebugger,
       completeStepFromBackground,
       ensureStep8SignupPageReady,
+      getState,
       getStep8CallbackUrlFromNavigation,
       getStep8CallbackUrlFromTabUpdate,
       getStep8EffectLabel,
@@ -30,6 +31,7 @@
       setWebNavCommittedListener,
       setStep8PendingReject,
       setStep8TabUpdatedListener,
+      resolveStep8PhoneVerificationFlow,
     } = deps;
 
     async function executeStep8(state) {
@@ -121,6 +123,11 @@
             for (let round = 1; round <= STEP8_MAX_ROUNDS && !resolved; round++) {
               throwIfStep8SettledOrStopped(resolved);
               const pageState = await waitForStep8Ready(signupTabId, STEP8_READY_WAIT_TIMEOUT_MS);
+              if (pageState?.addPhonePage) {
+                const latestState = await getState();
+                await resolveStep8PhoneVerificationFlow(latestState, pageState);
+                return;
+              }
               if (!pageState?.consentReady) {
                 await sleepWithStop(STEP8_CLICK_RETRY_DELAY_MS);
                 continue;
@@ -144,6 +151,13 @@
 
               const effect = await waitForStep8ClickEffect(signupTabId, pageState.url);
               if (resolved) {
+                return;
+              }
+
+              const latestAuthState = await waitForStep8Ready(signupTabId, STEP8_READY_WAIT_TIMEOUT_MS).catch(() => null);
+              if (latestAuthState?.addPhonePage) {
+                const latestState = await getState();
+                await resolveStep8PhoneVerificationFlow(latestState, latestAuthState);
                 return;
               }
 

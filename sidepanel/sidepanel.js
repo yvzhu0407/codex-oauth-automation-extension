@@ -129,6 +129,7 @@ const btnDeleteAllHotmailAccounts = document.getElementById('btn-delete-all-hotm
 const btnToggleHotmailList = document.getElementById('btn-toggle-hotmail-list');
 const hotmailListShell = document.getElementById('hotmail-list-shell');
 const hotmailAccountsList = document.getElementById('hotmail-accounts-list');
+const inputHeroSmsApiKey = document.getElementById('input-hero-sms-api-key');
 const inputLuckmailApiKey = document.getElementById('input-luckmail-api-key');
 const inputLuckmailBaseUrl = document.getElementById('input-luckmail-base-url');
 const selectLuckmailEmailType = document.getElementById('select-luckmail-email-type');
@@ -1152,6 +1153,7 @@ function collectSettingsPayload() {
     hotmailServiceMode: getSelectedHotmailServiceMode(),
     hotmailRemoteBaseUrl: inputHotmailRemoteBaseUrl.value.trim(),
     hotmailLocalBaseUrl: inputHotmailLocalBaseUrl.value.trim(),
+    heroSmsApiKey: inputHeroSmsApiKey?.value || '',
     luckmailApiKey: inputLuckmailApiKey.value,
     luckmailBaseUrl: normalizeLuckmailBaseUrl(inputLuckmailBaseUrl.value),
     luckmailEmailType: normalizeLuckmailEmailType(selectLuckmailEmailType.value),
@@ -1568,6 +1570,9 @@ function applySettingsState(state) {
   setHotmailServiceMode(state?.hotmailServiceMode);
   inputHotmailRemoteBaseUrl.value = state?.hotmailRemoteBaseUrl || '';
   inputHotmailLocalBaseUrl.value = state?.hotmailLocalBaseUrl || '';
+  if (inputHeroSmsApiKey) {
+    inputHeroSmsApiKey.value = state?.heroSmsApiKey || '';
+  }
   inputLuckmailApiKey.value = state?.luckmailApiKey || '';
   inputLuckmailBaseUrl.value = normalizeLuckmailBaseUrl(state?.luckmailBaseUrl);
   selectLuckmailEmailType.value = normalizeLuckmailEmailType(state?.luckmailEmailType);

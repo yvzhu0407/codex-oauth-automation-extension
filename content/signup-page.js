@@ -22,6 +22,8 @@ if (document.documentElement.getAttribute(SIGNUP_PAGE_LISTENER_SENTINEL) !== '1'
       || message.type === 'RESEND_VERIFICATION_CODE'
       || message.type === 'ENSURE_SIGNUP_ENTRY_READY'
       || message.type === 'ENSURE_SIGNUP_PASSWORD_PAGE_READY'
+      || message.type === 'ADD_PHONE_FILL_NUMBER'
+      || message.type === 'ADD_PHONE_FILL_CODE'
     ) {
       resetStopState();
       handleCommand(message).then((result) => {
@@ -77,6 +79,10 @@ async function handleCommand(message) {
       return await ensureSignupEntryReady();
     case 'ENSURE_SIGNUP_PASSWORD_PAGE_READY':
       return await ensureSignupPasswordPageReady();
+    case 'ADD_PHONE_FILL_NUMBER':
+      return await fillAddPhoneNumber(message.payload);
+    case 'ADD_PHONE_FILL_CODE':
+      return await fillAddPhoneVerificationCode(message.payload);
     case 'STEP8_FIND_AND_CLICK':
       return await step8_findAndClick();
     case 'STEP8_GET_STATE':
@@ -558,6 +564,40 @@ const OAUTH_CONSENT_PAGE_PATTERN = /使用\s*ChatGPT\s*登录到\s*Codex|sign\s+
 const OAUTH_CONSENT_FORM_SELECTOR = 'form[action*="/sign-in-with-chatgpt/" i][action*="/consent" i]';
 const CONTINUE_ACTION_PATTERN = /继续|continue/i;
 const ADD_PHONE_PAGE_PATTERN = /add[\s-]*phone|添加手机号|手机号码|手机号|phone\s+number|telephone/i;
+const ADD_PHONE_INPUT_SELECTOR = [
+  'input#tel',
+  'input[autocomplete="tel"]',
+  'input[name="__reservedForPhoneNumberInput_tel"]',
+  'input[type="tel"]:not([maxlength="6"])',
+  'input[name*="phone" i]',
+  'input[id*="phone" i]',
+  'input[aria-label*="phone" i]',
+  'input[placeholder*="phone" i]',
+].join(', ');
+const ADD_PHONE_CODE_INPUT_SELECTOR = [
+  'input[autocomplete="one-time-code"]',
+  'input[name="code"]',
+  'input[name="otp"]',
+  'input[inputmode="numeric"]',
+  'input[maxlength="6"]',
+  'input[type="tel"][maxlength="6"]',
+  'input[type="text"][maxlength="6"]',
+].join(', ');
+const ADD_PHONE_SUBMIT_PATTERN = /继续|continue|next|verify|验证|submit|发送|send/i;
+const ADD_PHONE_INVALID_PATTERN = /号码无效|手机号无效|此电话号码无法使用|phone\s+number.*invalid|invalid\s+phone|unable\s+to\s+send|try\s+another\s+number|maximum\s+number\s+of\s+uses|too\s+many\s+times/i;
+const ADD_PHONE_MAX_USAGE_PATTERN = /maximum\s+number\s+of\s+uses|too\s+many\s+times|已达到使用上限|次数过多/i;
+const ADD_PHONE_COUNTRY_SELECTOR = [
+  'select[name*="country" i]',
+  'select[id*="country" i]',
+  'select[aria-label*="country" i]',
+  'button[aria-haspopup="listbox"][aria-label*="country" i]',
+  'button[aria-haspopup="listbox"][id*="country" i]',
+  '[role="combobox"][aria-label*="country" i]',
+  'button[aria-haspopup="listbox"][aria-labelledby*="Phone number country code" i]',
+].join(', ');
+const ADD_PHONE_COUNTRY_OPTION_LABELS = {
+  '52': ['TH', 'Thailand', '泰国', 'ไทย', '+66', '66'],
+};
 const STEP5_SUBMIT_ERROR_PATTERN = /无法根据该信息创建帐户|请重试|unable\s+to\s+create\s+(?:your\s+)?account|couldn'?t\s+create\s+(?:your\s+)?account|something\s+went\s+wrong|invalid\s+(?:birthday|birth|date)|生日|出生日期/i;
 const AUTH_TIMEOUT_ERROR_TITLE_PATTERN = /糟糕，出错了|something\s+went\s+wrong|oops/i;
 const AUTH_TIMEOUT_ERROR_DETAIL_PATTERN = /operation\s+timed\s+out|timed\s+out|请求超时|操作超时/i;
@@ -677,14 +717,345 @@ function isAddPhonePageReady() {
   const path = `${location.pathname || ''} ${location.href || ''}`;
   if (/\/add-phone(?:[/?#]|$)/i.test(path)) return true;
 
-  const phoneInput = document.querySelector(
-    'input[type="tel"]:not([maxlength="6"]), input[name*="phone" i], input[id*="phone" i], input[autocomplete="tel"]'
-  );
+  const phoneInput = findAddPhoneInput();
   if (phoneInput && isVisibleElement(phoneInput)) {
     return true;
   }
 
   return ADD_PHONE_PAGE_PATTERN.test(getPageTextSnapshot());
+}
+
+function findAddPhoneInput() {
+  const candidates = Array.from(document.querySelectorAll(ADD_PHONE_INPUT_SELECTOR));
+  return candidates.find((el) => isVisibleElement(el)) || null;
+}
+
+function findAddPhoneCodeInput() {
+  const direct = document.querySelector(ADD_PHONE_CODE_INPUT_SELECTOR);
+  if (direct && isVisibleElement(direct)) {
+    return direct;
+  }
+
+  const splitInputs = Array.from(document.querySelectorAll('input[maxlength="1"]'))
+    .filter(isVisibleElement);
+  if (splitInputs.length >= 6) {
+    return splitInputs[0];
+  }
+
+  return null;
+}
+
+function findAddPhoneSubmitButton({ allowDisabled = false } = {}) {
+  const direct = document.querySelector('button[type="submit"], input[type="submit"]');
+  if (direct && isVisibleElement(direct) && (allowDisabled || isActionEnabled(direct))) {
+    return direct;
+  }
+
+  const candidates = document.querySelectorAll(
+    'button, a, [role="button"], [role="link"], input[type="button"], input[type="submit"]'
+  );
+  return Array.from(candidates).find((el) => {
+    if (!isVisibleElement(el) || (!allowDisabled && !isActionEnabled(el))) return false;
+    return ADD_PHONE_SUBMIT_PATTERN.test(getActionText(el));
+  }) || null;
+}
+
+function findAddPhoneErrorText() {
+  const messages = [];
+  const selectors = [
+    '.react-aria-FieldError',
+    '[slot="errorMessage"]',
+    '[id$="-error"]',
+    '[id$="-errors"]',
+    '[role="alert"]',
+    '[aria-live="assertive"]',
+    '[aria-live="polite"]',
+    '[class*="error"]',
+  ];
+
+  for (const selector of selectors) {
+    document.querySelectorAll(selector).forEach((el) => {
+      if (!isVisibleElement(el)) return;
+      const text = normalizeInlineText(el.textContent);
+      if (text && ADD_PHONE_INVALID_PATTERN.test(text)) {
+        messages.push(text);
+      }
+    });
+  }
+
+  return messages[0] || '';
+}
+
+function isPhoneMaxUsageExceededError(errorText = '') {
+  return ADD_PHONE_MAX_USAGE_PATTERN.test(normalizeInlineText(errorText));
+}
+
+function parsePhoneNumberParts(payload = {}) {
+  const rawPhoneNumber = String(payload.phoneNumber || payload.value || '').trim();
+  const rawNationalNumber = String(payload.nationalNumber || '').trim();
+  const heroCountryCode = String(payload.country || '').trim();
+  const phoneDigits = rawPhoneNumber.replace(/\D+/g, '');
+  const nationalDigits = rawNationalNumber.replace(/\D+/g, '');
+
+  if (!phoneDigits && !nationalDigits) {
+    return {
+      countryCode: heroCountryCode,
+      nationalNumber: '',
+      fullDigits: '',
+    };
+  }
+
+  if (heroCountryCode && phoneDigits.length > 2) {
+    return {
+      countryCode: heroCountryCode,
+      nationalNumber: phoneDigits.slice(2),
+      fullDigits: phoneDigits,
+    };
+  }
+
+  if (nationalDigits) {
+    const countryCode = phoneDigits.startsWith(nationalDigits)
+      ? ''
+      : phoneDigits.slice(0, Math.max(0, phoneDigits.length - nationalDigits.length));
+    return {
+      countryCode,
+      nationalNumber: nationalDigits,
+      fullDigits: phoneDigits,
+    };
+  }
+
+  if (phoneDigits.length <= 10) {
+    return {
+      countryCode: '',
+      nationalNumber: phoneDigits,
+      fullDigits: phoneDigits,
+    };
+  }
+
+  return {
+    countryCode: phoneDigits.slice(0, phoneDigits.length - 10),
+    nationalNumber: phoneDigits.slice(-10),
+    fullDigits: phoneDigits,
+  };
+}
+
+function normalizePhoneNumberForOpenAI(value = '') {
+  return parsePhoneNumberParts({ phoneNumber: value }).nationalNumber;
+}
+
+function normalizeAppliedPhoneValue(value = '') {
+  return String(value || '').replace(/\D+/g, '');
+}
+
+function didPhoneValueApply(input, expectedDigits) {
+  if (!input || !expectedDigits) return false;
+  const appliedValue = normalizeAppliedPhoneValue(input.value || input.getAttribute('value') || '');
+  return appliedValue === expectedDigits || appliedValue.endsWith(expectedDigits);
+}
+
+function getAddPhoneCountryOptionLabels(countryCode = '') {
+  return ADD_PHONE_COUNTRY_OPTION_LABELS[String(countryCode || '').trim()] || [];
+}
+
+function getAddPhoneCountryNativeSelect() {
+  const candidates = Array.from(document.querySelectorAll('div[data-testid="hidden-select-container"] select, .react-aria-Select + div select, label select, select'));
+  return candidates.find((el) => el?.options?.length) || null;
+}
+
+function getAddPhoneCountryButton() {
+  const candidates = Array.from(document.querySelectorAll(ADD_PHONE_COUNTRY_SELECTOR));
+  return candidates.find((el) => isVisibleElement(el)) || null;
+}
+
+function getAddPhoneCountryButtonText() {
+  const button = getAddPhoneCountryButton();
+  return normalizeInlineText(getActionText(button) || button?.textContent || '');
+}
+
+function countrySelectionMatches(buttonText, labels = []) {
+  const normalizedText = normalizeInlineText(buttonText);
+  if (!normalizedText) return false;
+  return labels.some((label) => normalizedText.includes(normalizeInlineText(label)));
+}
+
+async function selectAddPhoneCountry(countryCode = '') {
+  const normalizedCountryCode = String(countryCode || '').trim();
+  if (!normalizedCountryCode) {
+    return false;
+  }
+
+  const labels = getAddPhoneCountryOptionLabels(normalizedCountryCode);
+  if (!labels.length) {
+    return false;
+  }
+
+  const nativeSelect = getAddPhoneCountryNativeSelect();
+  if (nativeSelect) {
+    const option = Array.from(nativeSelect.options).find((item) => {
+      const texts = [item.value, item.textContent, item.label]
+        .filter(Boolean)
+        .map((text) => normalizeInlineText(text));
+      return labels.some((label) => texts.some((text) => text === normalizeInlineText(label) || text.includes(normalizeInlineText(label))));
+    });
+
+    if (!option) {
+      throw new Error(`未找到国家区号 +${normalizedCountryCode} 对应的国家选项。`);
+    }
+
+    nativeSelect.value = option.value;
+    option.selected = true;
+    nativeSelect.dispatchEvent(new Event('input', { bubbles: true }));
+    nativeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    await sleep(500);
+
+    const buttonText = getAddPhoneCountryButtonText();
+    if (buttonText && !countrySelectionMatches(buttonText, labels)) {
+      throw new Error(`国家切换未生效，当前显示为 ${buttonText}。`);
+    }
+    return true;
+  }
+
+  const button = getAddPhoneCountryButton();
+  if (!button) {
+    return false;
+  }
+
+  await humanPause(250, 650);
+  simulateClick(button);
+  await sleep(400);
+
+  const optionSelectors = [
+    '[role="option"]',
+    '[role="listbox"] [role="button"]',
+    '[data-rac] [role="option"]',
+    'li',
+    'button',
+  ];
+  const optionNodes = Array.from(document.querySelectorAll(optionSelectors.join(', ')));
+  const matchedOption = optionNodes.find((el) => {
+    if (!isVisibleElement(el)) return false;
+    const text = normalizeInlineText(getActionText(el) || el.textContent || '');
+    return labels.some((label) => text.includes(normalizeInlineText(label)));
+  });
+
+  if (!matchedOption) {
+    throw new Error(`国家选择框已打开，但未找到区号 +${normalizedCountryCode} 对应的国家选项。`);
+  }
+
+  await humanPause(250, 650);
+  simulateClick(matchedOption);
+  await sleep(500);
+
+  const buttonText = getAddPhoneCountryButtonText();
+  if (buttonText && !countrySelectionMatches(buttonText, labels)) {
+    throw new Error(`国家切换未生效，当前显示为 ${buttonText}。`);
+  }
+  return true;
+}
+
+async function waitForAddPhoneNumberSubmitOutcome(expectedDigits, timeout = 15000) {
+  const start = Date.now();
+
+  while (Date.now() - start < timeout) {
+    throwIfStopped();
+
+    const errorText = findAddPhoneErrorText();
+    if (errorText) {
+      return {
+        invalidPhone: true,
+        retryWithAnotherPhone: isPhoneMaxUsageExceededError(errorText),
+        errorText,
+      };
+    }
+
+    const phoneInput = findAddPhoneInput();
+    const codeInput = findAddPhoneCodeInput();
+    if (codeInput && (!phoneInput || !didPhoneValueApply(phoneInput, expectedDigits))) {
+      return { success: true };
+    }
+
+    await sleep(150);
+  }
+
+  const finalErrorText = findAddPhoneErrorText();
+  if (finalErrorText) {
+    return {
+      invalidPhone: true,
+      retryWithAnotherPhone: isPhoneMaxUsageExceededError(finalErrorText),
+      errorText: finalErrorText,
+    };
+  }
+
+  return { invalidPhone: true, errorText: '提交手机号后未进入验证码输入阶段。' };
+}
+
+async function fillAddPhoneNumber(payload = {}) {
+  const { countryCode, nationalNumber } = parsePhoneNumberParts(payload);
+  if (!nationalNumber) {
+    throw new Error('未提供可用的手机号。');
+  }
+
+  if (!isAddPhonePageReady()) {
+    throw new Error('当前页面不是手机号页面。URL: ' + location.href);
+  }
+
+  await selectAddPhoneCountry(countryCode);
+
+  const phoneInput = findAddPhoneInput() || await waitForElement(ADD_PHONE_INPUT_SELECTOR, 10000).catch(() => null);
+  if (!phoneInput) {
+    throw new Error('未找到手机号输入框。URL: ' + location.href);
+  }
+
+  await humanPause(350, 900);
+  fillInput(phoneInput, nationalNumber);
+  phoneInput.focus();
+  phoneInput.blur();
+  await sleep(300);
+
+  if (!didPhoneValueApply(phoneInput, nationalNumber)) {
+    throw new Error(`手机号未成功写入输入框。期望后缀 ${nationalNumber}，实际 ${(phoneInput.value || '空')}。`);
+  }
+
+  const submitBtn = findAddPhoneSubmitButton({ allowDisabled: true });
+  if (!submitBtn) {
+    throw new Error('未找到手机号页面提交按钮。URL: ' + location.href);
+  }
+
+  await humanPause(350, 900);
+  simulateClick(submitBtn);
+
+  return await waitForAddPhoneNumberSubmitOutcome(nationalNumber);
+}
+
+async function fillAddPhoneVerificationCode(payload = {}) {
+  const code = String(payload.code || '').trim();
+  if (!code) {
+    throw new Error('未提供手机验证码。');
+  }
+
+  const target = findAddPhoneCodeInput() || await waitForElement(ADD_PHONE_CODE_INPUT_SELECTOR, 10000).catch(() => null);
+  if (!target) {
+    const splitInputs = Array.from(document.querySelectorAll('input[maxlength="1"]')).filter(isVisibleElement);
+    if (splitInputs.length >= 6) {
+      for (let i = 0; i < Math.min(code.length, splitInputs.length); i++) {
+        await humanPause(80, 180);
+        fillInput(splitInputs[i], code[i]);
+      }
+      return { success: true };
+    }
+    throw new Error('未找到手机验证码输入框。URL: ' + location.href);
+  }
+
+  await humanPause(250, 650);
+  fillInput(target, code);
+
+  const submitBtn = findAddPhoneSubmitButton({ allowDisabled: true });
+  if (submitBtn && isActionEnabled(submitBtn)) {
+    await humanPause(250, 650);
+    simulateClick(submitBtn);
+  }
+
+  return { success: true };
 }
 
 function isStep8Ready() {

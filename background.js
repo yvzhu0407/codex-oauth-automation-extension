@@ -126,6 +126,15 @@ const HUMAN_STEP_DELAY_MIN = 700;
 const HUMAN_STEP_DELAY_MAX = 2200;
 const STEP6_MAX_ATTEMPTS = 3;
 const STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS = 8;
+const HERO_SMS_STEP8_MAX_RETRIES = 2;
+const HERO_SMS_STEP8_POLL_INTERVAL_MS = 3000;
+const HERO_SMS_STEP8_POLL_TIMEOUT_MS = 270000;
+const HERO_SMS_STEP8_POLL_MAX_ATTEMPTS = Math.max(1, Math.ceil(HERO_SMS_STEP8_POLL_TIMEOUT_MS / HERO_SMS_STEP8_POLL_INTERVAL_MS));
+const HERO_SMS_REUSE_MAX_USES = 2;
+const HERO_SMS_API_URL = 'https://hero-sms.com/stubs/handler_api.php';
+const HERO_SMS_SERVICE = 'dr';
+const HERO_SMS_COUNTRY = '52';
+const HERO_SMS_CANCEL_STATUS = '8';
 const SUB2API_STEP1_RESPONSE_TIMEOUT_MS = 90000;
 const SUB2API_STEP9_RESPONSE_TIMEOUT_MS = 120000;
 const DEFAULT_SUB2API_URL = 'https://sub2api.hisence.fun/admin/accounts';
@@ -221,6 +230,7 @@ const PERSISTED_SETTING_DEFAULTS = {
   hotmailServiceMode: HOTMAIL_SERVICE_MODE_LOCAL,
   hotmailRemoteBaseUrl: DEFAULT_HOTMAIL_REMOTE_BASE_URL,
   hotmailLocalBaseUrl: DEFAULT_HOTMAIL_LOCAL_BASE_URL,
+  heroSmsApiKey: '',
   cloudflareDomain: '',
   cloudflareDomains: [],
   cloudflareTempEmailBaseUrl: '',
@@ -303,6 +313,8 @@ const DEFAULT_STATE = {
   loginVerificationRequestedAt: null,
   currentHotmailAccountId: null,
   preferredIcloudHost: '',
+  heroSmsReusableActivation: null,
+  heroSmsPendingActivation: null,
 };
 
 function normalizeAutoRunDelayMinutes(value) {
@@ -792,6 +804,8 @@ function normalizePersistentSettingValue(key, value) {
       return normalizeHotmailRemoteBaseUrl(value);
     case 'hotmailLocalBaseUrl':
       return normalizeHotmailLocalBaseUrl(value);
+    case 'heroSmsApiKey':
+      return String(value || '').trim();
     case 'cloudflareDomain':
       return normalizeCloudflareDomain(value);
     case 'cloudflareDomains':
@@ -5821,6 +5835,241 @@ function isAddPhoneAuthState(authState = {}) {
     || isAddPhoneAuthUrl(authState?.url);
 }
 
+function normalizeHeroSmsReusableActivation(raw = null) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+
+  const activationId = String(raw.activationId || '').trim();
+  const phoneNumber = String(raw.phoneNumber || '').trim();
+  const nationalNumber = String(raw.nationalNumber || '').trim();
+  const lastCode = String(raw.lastCode || '').trim();
+  const remainingUses = Math.max(
+    0,
+    Math.min(HERO_SMS_REUSE_MAX_USES, Math.floor(Number(raw.remainingUses) || 0))
+  );
+
+  if (!activationId || !phoneNumber || remainingUses < 1) {
+    return null;
+  }
+
+  return {
+    activationId,
+    phoneNumber,
+    nationalNumber,
+    lastCode,
+    remainingUses,
+  };
+}
+
+function normalizeHeroSmsPendingActivation(raw = null) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+
+  const activationId = String(raw.activationId || '').trim();
+  const phoneNumber = String(raw.phoneNumber || '').trim();
+  const nationalNumber = String(raw.nationalNumber || '').trim();
+  const status = String(raw.status || '').trim();
+  const startedAt = Number(raw.startedAt);
+
+  if (!activationId || !phoneNumber) {
+    return null;
+  }
+
+  return {
+    activationId,
+    phoneNumber,
+    nationalNumber,
+    status: status || 'waiting_code',
+    startedAt: Number.isFinite(startedAt) && startedAt > 0 ? startedAt : Date.now(),
+  };
+}
+
+function normalizeHeroSmsPhoneNumber(rawNumber) {
+  const digits = String(rawNumber || '').replace(/\D/g, '');
+  if (!digits) {
+    return {
+      phoneNumber: '',
+      nationalNumber: '',
+    };
+  }
+
+  return {
+    phoneNumber: `+${digits}`,
+    nationalNumber: digits.startsWith('52') ? digits.slice(2) : digits,
+  };
+}
+
+function parseHeroSmsActivationStartResponse(text) {
+  const parts = String(text || '').split(':');
+  if (parts.length < 3 || parts[0] !== 'ACCESS_NUMBER') {
+    throw new Error(text || 'Hero SMS 买号返回无效。');
+  }
+
+  const activationId = String(parts[1] || '').trim();
+  const numbers = normalizeHeroSmsPhoneNumber(parts.slice(2).join(':'));
+  if (!activationId || !numbers.phoneNumber || !numbers.nationalNumber) {
+    throw new Error(text || 'Hero SMS 号码返回无效。');
+  }
+
+  return {
+    activationId,
+    phoneNumber: numbers.phoneNumber,
+    nationalNumber: numbers.nationalNumber,
+    service: HERO_SMS_SERVICE,
+    country: Number(HERO_SMS_COUNTRY),
+  };
+}
+
+function parseHeroSmsActivationStatusResponse(text) {
+  const parts = String(text || '').split(':');
+  const status = String(parts[0] || '').trim();
+  if (status === 'STATUS_OK') {
+    return {
+      status: 'code_received',
+      code: String(parts[1] || '').trim(),
+      upstreamStatus: status,
+    };
+  }
+  if (status === 'STATUS_WAIT_CODE' || status === 'STATUS_WAIT_RETRY' || status === 'STATUS_WAIT_RESEND') {
+    return {
+      status: 'pending',
+      code: '',
+      upstreamStatus: status,
+    };
+  }
+  if (status === 'STATUS_CANCEL') {
+    return {
+      status: 'cancelled',
+      code: '',
+      upstreamStatus: status,
+    };
+  }
+  throw new Error(text || 'Hero SMS 查码返回无效。');
+}
+
+function parseHeroSmsActivationReadyResponse(text) {
+  const status = String(text || '').trim();
+  if (status === 'ACCESS_READY' || status === 'ACCESS_RETRY_GET') {
+    return {
+      status: 'ready',
+      upstreamStatus: status,
+    };
+  }
+  throw new Error(text || 'Hero SMS 激活号码返回无效。');
+}
+
+function parseHeroSmsActivationCancelResponse(text) {
+  const status = String(text || '').trim();
+  if (status === 'ACCESS_CANCEL' || status === 'ACCESS_ACTIVATION') {
+    return {
+      status: 'cancelled',
+    };
+  }
+  throw new Error(text || 'Hero SMS 取消号码返回无效。');
+}
+
+async function fetchHeroSmsText(params, actionLabel) {
+  const timeoutMs = 30000;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
+  const url = `${HERO_SMS_API_URL}?${new URLSearchParams(params).toString()}`;
+
+  let response;
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      signal: controller.signal,
+    });
+  } catch (err) {
+    throw new Error(
+      err?.name === 'AbortError'
+        ? `Hero SMS ${actionLabel}超时（>${Math.round(timeoutMs / 1000)} 秒）`
+        : `Hero SMS ${actionLabel}失败：${err?.message || err}`
+    );
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  const text = String(await response.text()).trim();
+  if (!response.ok) {
+    throw new Error(`Hero SMS ${actionLabel}失败：${text || `HTTP ${response.status}`}`);
+  }
+  return text;
+}
+
+async function requestHeroSmsActivationStart(state) {
+  const apiKey = String(state?.heroSmsApiKey || '').trim();
+  if (!apiKey) {
+    throw new Error('缺少 Hero SMS API Key。');
+  }
+
+  const text = await fetchHeroSmsText({
+    api_key: apiKey,
+    action: 'getNumber',
+    service: HERO_SMS_SERVICE,
+    country: HERO_SMS_COUNTRY,
+  }, '买号');
+  return parseHeroSmsActivationStartResponse(text);
+}
+
+async function requestHeroSmsActivationStatus(state, activationId) {
+  const apiKey = String(state?.heroSmsApiKey || '').trim();
+  const normalizedActivationId = String(activationId || '').trim();
+  if (!apiKey) {
+    throw new Error('缺少 Hero SMS API Key。');
+  }
+  if (!normalizedActivationId) {
+    throw new Error('缺少 Hero SMS activationId。');
+  }
+
+  const text = await fetchHeroSmsText({
+    api_key: apiKey,
+    action: 'getStatus',
+    id: normalizedActivationId,
+  }, '查码');
+  return parseHeroSmsActivationStatusResponse(text);
+}
+
+async function requestHeroSmsActivationReady(state, activationId) {
+  const apiKey = String(state?.heroSmsApiKey || '').trim();
+  const normalizedActivationId = String(activationId || '').trim();
+  if (!apiKey) {
+    throw new Error('缺少 Hero SMS API Key。');
+  }
+  if (!normalizedActivationId) {
+    throw new Error('缺少 Hero SMS activationId。');
+  }
+
+  const text = await fetchHeroSmsText({
+    api_key: apiKey,
+    action: 'setStatus',
+    id: normalizedActivationId,
+    status: '1',
+  }, '激活号码');
+  return parseHeroSmsActivationReadyResponse(text);
+}
+
+async function requestHeroSmsActivationCancel(state, activationId) {
+  const apiKey = String(state?.heroSmsApiKey || '').trim();
+  const normalizedActivationId = String(activationId || '').trim();
+  if (!apiKey) {
+    throw new Error('缺少 Hero SMS API Key。');
+  }
+  if (!normalizedActivationId) {
+    throw new Error('缺少 Hero SMS activationId。');
+  }
+
+  const text = await fetchHeroSmsText({
+    api_key: apiKey,
+    action: 'setStatus',
+    id: normalizedActivationId,
+    status: HERO_SMS_CANCEL_STATUS,
+  }, '取消号码');
+  return parseHeroSmsActivationCancelResponse(text);
+}
+
 async function getPostStep6AutoRestartDecision(step, error) {
   const normalizedStep = Number(step);
   const errorMessage = getErrorMessage(error);
@@ -6045,7 +6294,7 @@ async function waitForStep8Ready(tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS)
     throwIfStopped();
     const pageState = await getStep8PageState(tabId);
     if (pageState?.addPhonePage) {
-      throw new Error('步骤 8：认证页进入了手机号页面，当前不是 OAuth 同意页，无法继续自动授权。');
+      return pageState;
     }
     if (pageState?.consentReady) {
       return pageState;
@@ -6173,7 +6422,7 @@ async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLI
 
     const pageState = await getStep8PageState(tabId);
     if (pageState?.addPhonePage) {
-      throw new Error('步骤 8：点击“继续”后页面跳到了手机号页面，当前流程无法继续自动授权。');
+      return { progressed: true, reason: 'add_phone_page', url: pageState.url || '' };
     }
     if (pageState === null) {
       if (!recovered) {
@@ -6201,6 +6450,8 @@ function getStep8EffectLabel(effect) {
       return `URL 已变化：${effect.url}`;
     case 'page_reloading':
       return '页面正在跳转或重载';
+    case 'add_phone_page':
+      return '页面已进入手机号验证页';
     case 'left_consent_page':
       return `页面已离开 OAuth 同意页：${effect.url || 'unknown'}`;
     default:
@@ -6218,6 +6469,7 @@ const step8Executor = self.MultiPageBackgroundStep8?.createStep8Executor({
   getStep8CallbackUrlFromNavigation,
   getStep8CallbackUrlFromTabUpdate,
   getStep8EffectLabel,
+  getState,
   getTabId,
   getWebNavCommittedListener,
   getWebNavListener,
@@ -6225,6 +6477,7 @@ const step8Executor = self.MultiPageBackgroundStep8?.createStep8Executor({
   isTabAlive,
   prepareStep8DebuggerClick,
   reloadStep8ConsentPage,
+  resolveStep8PhoneVerificationFlow,
   reuseOrCreateTab,
   setStep8PendingReject,
   setStep8TabUpdatedListener,
@@ -6240,6 +6493,209 @@ const step8Executor = self.MultiPageBackgroundStep8?.createStep8Executor({
   waitForStep8ClickEffect,
   waitForStep8Ready,
 });
+
+async function resolveStep8PhoneVerificationFlow(state, authState = {}) {
+  if (!isAddPhoneAuthState(authState)) {
+    return { ok: true, skipped: true };
+  }
+
+  const heroSmsApiKey = String(state?.heroSmsApiKey || '').trim();
+  if (!heroSmsApiKey) {
+    throw new Error('步骤 8：已进入手机号页面，但未配置 Hero SMS API Key。');
+  }
+
+  const maxRetries = Math.max(1, Number(HERO_SMS_STEP8_MAX_RETRIES) || 1);
+  const pollIntervalMs = Math.max(250, Number(HERO_SMS_STEP8_POLL_INTERVAL_MS) || 3000);
+  const pollMaxAttempts = Math.max(1, Number(HERO_SMS_STEP8_POLL_MAX_ATTEMPTS) || 1);
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    throwIfStopped();
+    const latestState = attempt === 1 ? state : await getState();
+    const reusableActivation = attempt === 1
+      ? normalizeHeroSmsReusableActivation(latestState?.heroSmsReusableActivation)
+      : null;
+    const pendingActivation = normalizeHeroSmsPendingActivation(latestState?.heroSmsPendingActivation);
+    let activation = reusableActivation;
+    let activationCancelled = false;
+    let activatedForSms = false;
+    const isReusedActivation = Boolean(reusableActivation);
+    const shouldResumePendingActivation = !activation && pendingActivation && pendingActivation.status === 'waiting_code';
+    const previousCode = reusableActivation?.lastCode || '';
+    const pollStartedAt = shouldResumePendingActivation
+      ? pendingActivation.startedAt
+      : Date.now();
+
+    try {
+      if (shouldResumePendingActivation) {
+        activation = pendingActivation;
+        activatedForSms = true;
+        await addLog(`步骤 8：继续等待当前手机号 ${activation.phoneNumber || activation.nationalNumber} 的短信验证码...`, 'info');
+      }
+
+      if (!activation) {
+        await addLog(`步骤 8：正在向 Hero SMS 购买手机号（${attempt}/${maxRetries}）...`, 'info');
+        activation = await requestHeroSmsActivationStart(latestState);
+      }
+
+      if (!shouldResumePendingActivation) {
+        await addLog(`步骤 8：已获取手机号 ${activation.phoneNumber || activation.nationalNumber}，准备自动填写并提交...`, 'info');
+        const fillNumberResult = await sendToContentScriptResilient('signup-page', {
+          type: 'ADD_PHONE_FILL_NUMBER',
+          step: 8,
+          source: 'background',
+          payload: activation,
+        }, {
+          timeoutMs: 15000,
+          retryDelayMs: 600,
+          logMessage: '步骤 8：手机号页面正在切换，等待页面重新就绪后填写手机号...',
+        });
+
+        if (fillNumberResult?.error) {
+          throw new Error(fillNumberResult.error);
+        }
+        if (fillNumberResult?.invalidPhone) {
+          if (isReusedActivation) {
+            await setState({ heroSmsReusableActivation: null, heroSmsPendingActivation: null });
+          } else if (activation?.activationId) {
+            await requestHeroSmsActivationCancel(latestState, activation.activationId);
+            activationCancelled = true;
+          }
+          if (attempt < maxRetries && fillNumberResult?.retryWithAnotherPhone) {
+            await addLog(`步骤 8：当前手机号触发限制，正在更换新号码（${attempt + 1}/${maxRetries}）...`, 'warn');
+            continue;
+          }
+          throw new Error(`步骤 8：手机号被页面拒绝：${fillNumberResult.errorText || '号码被页面拒绝'}`);
+        }
+
+        await requestHeroSmsActivationReady(latestState, activation.activationId);
+        activatedForSms = true;
+        await addLog('步骤 8：手机号已提交成功，正在等待 Hero SMS 返回验证码...', 'info');
+        await setState({
+          heroSmsPendingActivation: {
+            activationId: activation.activationId,
+            phoneNumber: activation.phoneNumber,
+            nationalNumber: activation.nationalNumber,
+            status: 'waiting_code',
+            startedAt: pollStartedAt,
+          },
+        });
+      }
+
+      for (let pollAttempt = 1; pollAttempt <= pollMaxAttempts; pollAttempt++) {
+        throwIfStopped();
+        if (Date.now() - pollStartedAt >= HERO_SMS_STEP8_POLL_TIMEOUT_MS) {
+          throw new Error('步骤 8：等待 Hero SMS 验证码超时（4 分 30 秒）。');
+        }
+        const statusResult = await requestHeroSmsActivationStatus(latestState, activation.activationId);
+
+        if (statusResult?.status === 'code_received' && statusResult.code) {
+          if (previousCode && statusResult.code === previousCode) {
+            if (pollAttempt < pollMaxAttempts) {
+              await sleepWithStop(pollIntervalMs);
+              continue;
+            }
+            throw new Error('步骤 8：Hero SMS 尚未返回新的短信验证码。');
+          }
+
+          await addLog(`步骤 8：已收到 Hero SMS 验证码 ${statusResult.code}，准备自动提交...`, 'info');
+          const fillCodeResult = await sendToContentScriptResilient('signup-page', {
+            type: 'ADD_PHONE_FILL_CODE',
+            step: 8,
+            source: 'background',
+            payload: { activationId: activation.activationId, code: statusResult.code },
+          }, {
+            timeoutMs: 15000,
+            retryDelayMs: 600,
+            logMessage: '步骤 8：验证码页面正在切换，等待页面重新就绪后填写短信验证码...',
+          });
+
+          if (fillCodeResult?.error) {
+            throw new Error(fillCodeResult.error);
+          }
+          if (fillCodeResult?.invalidPhone) {
+            if (isReusedActivation) {
+              await setState({ heroSmsReusableActivation: null, heroSmsPendingActivation: null });
+            } else if (activation?.activationId && !activationCancelled) {
+              await requestHeroSmsActivationCancel(latestState, activation.activationId);
+              activationCancelled = true;
+            }
+            if (attempt < maxRetries && fillCodeResult?.retryWithAnotherPhone) {
+              await setState({ heroSmsPendingActivation: null });
+              await addLog(`步骤 8：当前手机号触发限制，正在更换新号码（${attempt + 1}/${maxRetries}）...`, 'warn');
+              continue;
+            }
+            throw new Error(`步骤 8：手机号被页面拒绝：${fillCodeResult.errorText || activation.phoneNumber || activation.nationalNumber || '号码被页面拒绝'}`);
+          }
+          if (fillCodeResult?.invalidCode) {
+            throw new Error(`步骤 8：手机验证码被页面拒绝：${fillCodeResult.errorText || statusResult.code}`);
+          }
+
+          const remainingUses = Math.max(
+            0,
+            (Number.isFinite(Number(activation.remainingUses)) ? Number(activation.remainingUses) : HERO_SMS_REUSE_MAX_USES) - 1
+          );
+          await setState({
+            heroSmsPendingActivation: null,
+            heroSmsReusableActivation: remainingUses > 0
+              ? {
+                activationId: activation.activationId,
+                phoneNumber: activation.phoneNumber,
+                nationalNumber: activation.nationalNumber,
+                remainingUses,
+                lastCode: statusResult.code,
+              }
+              : null,
+          });
+
+          await addLog(`步骤 8：手机号验证已通过，${remainingUses > 0 ? `当前号码剩余 ${remainingUses} 次可复用次数。` : '当前号码已用尽。'}`, 'ok');
+          return {
+            ok: true,
+            addPhonePage: true,
+            activationId: activation.activationId,
+            code: statusResult.code,
+            reusedActivation: isReusedActivation,
+            remainingPhoneUses: remainingUses,
+          };
+        }
+
+        if (statusResult?.status === 'cancelled') {
+          await setState({ heroSmsPendingActivation: null });
+          throw new Error('步骤 8：Hero SMS 激活已被取消。');
+        }
+
+        if (pollAttempt < pollMaxAttempts) {
+          const remainingMs = HERO_SMS_STEP8_POLL_TIMEOUT_MS - (Date.now() - pollStartedAt);
+          if (remainingMs <= 0) {
+            throw new Error('步骤 8：等待 Hero SMS 验证码超时（4 分 30 秒）。');
+          }
+          await sleepWithStop(Math.min(pollIntervalMs, remainingMs));
+        }
+      }
+
+      throw new Error('步骤 8：等待 Hero SMS 验证码超时（4 分 30 秒）。');
+    } catch (err) {
+      if (isReusedActivation) {
+        await setState({ heroSmsReusableActivation: null, heroSmsPendingActivation: null });
+      }
+      if (!isReusedActivation && activation?.activationId && !activationCancelled && activatedForSms) {
+        try {
+          await requestHeroSmsActivationCancel(latestState, activation.activationId);
+        } catch {
+        }
+        await setState({ heroSmsPendingActivation: null });
+      }
+      if (!isReusedActivation && (!activation || activationCancelled || !activatedForSms)) {
+        await setState({ heroSmsPendingActivation: null });
+      }
+      if (isReusedActivation && attempt < maxRetries) {
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw new Error('步骤 8：Hero SMS 手机号流程失败。');
+}
 
 async function executeStep8(state) {
   return step8Executor.executeStep8(state);
