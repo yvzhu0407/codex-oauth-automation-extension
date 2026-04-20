@@ -225,10 +225,18 @@
             ? Math.max(0, resendIntervalMs - (Date.now() - lastResendAt))
             : 0;
           if (remainingBeforeResendMs > 0) {
+            const nextPollDelayMs = Math.max(
+              250,
+              Math.min(
+                Math.max(1000, Number(payload.intervalMs) || 3000),
+                remainingBeforeResendMs
+              )
+            );
             await addLog(
-              `步骤 ${step}：距离下次重新发送验证码还差 ${Math.ceil(remainingBeforeResendMs / 1000)} 秒，继续刷新邮箱（第 ${round}/${maxRounds} 轮）...`,
+              `步骤 ${step}：距离下次重新发送验证码还差 ${Math.ceil(remainingBeforeResendMs / 1000)} 秒，${Math.ceil(nextPollDelayMs / 1000)} 秒后继续刷新邮箱（第 ${round}/${maxRounds} 轮）...`,
               'info'
             );
+            await sleepWithStop(nextPollDelayMs);
             continue;
           }
 
