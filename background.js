@@ -126,11 +126,10 @@ const HUMAN_STEP_DELAY_MIN = 700;
 const HUMAN_STEP_DELAY_MAX = 2200;
 const STEP6_MAX_ATTEMPTS = 3;
 const STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS = 8;
-const HERO_SMS_STEP8_MAX_RETRIES = 2;
+const HERO_SMS_STEP8_MAX_RETRIES = 3;
 const HERO_SMS_STEP8_POLL_INTERVAL_MS = 3000;
-const HERO_SMS_STEP8_POLL_TIMEOUT_MS = 270000;
+const HERO_SMS_STEP8_POLL_TIMEOUT_MS = 150000;
 const HERO_SMS_STEP8_POLL_MAX_ATTEMPTS = Math.max(1, Math.ceil(HERO_SMS_STEP8_POLL_TIMEOUT_MS / HERO_SMS_STEP8_POLL_INTERVAL_MS));
-const HERO_SMS_REUSE_MAX_USES = 2;
 const HERO_SMS_API_URL = 'https://hero-sms.com/stubs/handler_api.php';
 const HERO_SMS_SERVICE = 'dr';
 const HERO_SMS_COUNTRY = '52';
@@ -313,8 +312,6 @@ const DEFAULT_STATE = {
   loginVerificationRequestedAt: null,
   currentHotmailAccountId: null,
   preferredIcloudHost: '',
-  heroSmsReusableActivation: null,
-  heroSmsPendingActivation: null,
 };
 
 function normalizeAutoRunDelayMinutes(value) {
@@ -5835,57 +5832,6 @@ function isAddPhoneAuthState(authState = {}) {
     || isAddPhoneAuthUrl(authState?.url);
 }
 
-function normalizeHeroSmsReusableActivation(raw = null) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return null;
-  }
-
-  const activationId = String(raw.activationId || '').trim();
-  const phoneNumber = String(raw.phoneNumber || '').trim();
-  const nationalNumber = String(raw.nationalNumber || '').trim();
-  const lastCode = String(raw.lastCode || '').trim();
-  const remainingUses = Math.max(
-    0,
-    Math.min(HERO_SMS_REUSE_MAX_USES, Math.floor(Number(raw.remainingUses) || 0))
-  );
-
-  if (!activationId || !phoneNumber || remainingUses < 1) {
-    return null;
-  }
-
-  return {
-    activationId,
-    phoneNumber,
-    nationalNumber,
-    lastCode,
-    remainingUses,
-  };
-}
-
-function normalizeHeroSmsPendingActivation(raw = null) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return null;
-  }
-
-  const activationId = String(raw.activationId || '').trim();
-  const phoneNumber = String(raw.phoneNumber || '').trim();
-  const nationalNumber = String(raw.nationalNumber || '').trim();
-  const status = String(raw.status || '').trim();
-  const startedAt = Number(raw.startedAt);
-
-  if (!activationId || !phoneNumber) {
-    return null;
-  }
-
-  return {
-    activationId,
-    phoneNumber,
-    nationalNumber,
-    status: status || 'waiting_code',
-    startedAt: Number.isFinite(startedAt) && startedAt > 0 ? startedAt : Date.now(),
-  };
-}
-
 function normalizeHeroSmsPhoneNumber(rawNumber) {
   const digits = String(rawNumber || '').replace(/\D/g, '');
   if (!digits) {
@@ -6506,97 +6452,53 @@ async function resolveStep8PhoneVerificationFlow(state, authState = {}) {
 
   const maxRetries = Math.max(1, Number(HERO_SMS_STEP8_MAX_RETRIES) || 1);
   const pollIntervalMs = Math.max(250, Number(HERO_SMS_STEP8_POLL_INTERVAL_MS) || 3000);
-  const pollMaxAttempts = Math.max(1, Number(HERO_SMS_STEP8_POLL_MAX_ATTEMPTS) || 1);
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     throwIfStopped();
     const latestState = attempt === 1 ? state : await getState();
-    const reusableActivation = attempt === 1
-      ? normalizeHeroSmsReusableActivation(latestState?.heroSmsReusableActivation)
-      : null;
-    const pendingActivation = normalizeHeroSmsPendingActivation(latestState?.heroSmsPendingActivation);
-    let activation = reusableActivation;
+    let activation = null;
     let activationCancelled = false;
-    let activatedForSms = false;
-    const isReusedActivation = Boolean(reusableActivation);
-    const shouldResumePendingActivation = !activation && pendingActivation && pendingActivation.status === 'waiting_code';
-    const previousCode = reusableActivation?.lastCode || '';
-    const pollStartedAt = shouldResumePendingActivation
-      ? pendingActivation.startedAt
-      : Date.now();
 
     try {
-      if (shouldResumePendingActivation) {
-        activation = pendingActivation;
-        activatedForSms = true;
-        await addLog(`步骤 8：继续等待当前手机号 ${activation.phoneNumber || activation.nationalNumber} 的短信验证码...`, 'info');
+      await addLog(`步骤 8：正在向 Hero SMS 购买手机号（${attempt}/${maxRetries}）...`, 'info');
+      activation = await requestHeroSmsActivationStart(latestState);
+
+      await addLog(`步骤 8：已获取手机号 ${activation.phoneNumber || activation.nationalNumber}，准备自动填写并提交...`, 'info');
+      const fillNumberResult = await sendToContentScriptResilient('signup-page', {
+        type: 'ADD_PHONE_FILL_NUMBER',
+        step: 8,
+        source: 'background',
+        payload: activation,
+      }, {
+        timeoutMs: 15000,
+        retryDelayMs: 600,
+        logMessage: '步骤 8：手机号页面正在切换，等待页面重新就绪后填写手机号...',
+      });
+
+      if (fillNumberResult?.error) {
+        throw new Error(fillNumberResult.error);
       }
-
-      if (!activation) {
-        await addLog(`步骤 8：正在向 Hero SMS 购买手机号（${attempt}/${maxRetries}）...`, 'info');
-        activation = await requestHeroSmsActivationStart(latestState);
-      }
-
-      if (!shouldResumePendingActivation) {
-        await addLog(`步骤 8：已获取手机号 ${activation.phoneNumber || activation.nationalNumber}，准备自动填写并提交...`, 'info');
-        const fillNumberResult = await sendToContentScriptResilient('signup-page', {
-          type: 'ADD_PHONE_FILL_NUMBER',
-          step: 8,
-          source: 'background',
-          payload: activation,
-        }, {
-          timeoutMs: 15000,
-          retryDelayMs: 600,
-          logMessage: '步骤 8：手机号页面正在切换，等待页面重新就绪后填写手机号...',
-        });
-
-        if (fillNumberResult?.error) {
-          throw new Error(fillNumberResult.error);
+      if (fillNumberResult?.invalidPhone) {
+        if (activation?.activationId) {
+          await requestHeroSmsActivationCancel(latestState, activation.activationId).catch(() => null);
+          activationCancelled = true;
         }
-        if (fillNumberResult?.invalidPhone) {
-          if (isReusedActivation) {
-            await setState({ heroSmsReusableActivation: null, heroSmsPendingActivation: null });
-          } else if (activation?.activationId) {
-            await requestHeroSmsActivationCancel(latestState, activation.activationId);
-            activationCancelled = true;
-          }
-          if (attempt < maxRetries && fillNumberResult?.retryWithAnotherPhone) {
-            await addLog(`步骤 8：当前手机号触发限制，正在更换新号码（${attempt + 1}/${maxRetries}）...`, 'warn');
-            continue;
-          }
-          throw new Error(`步骤 8：手机号被页面拒绝：${fillNumberResult.errorText || '号码被页面拒绝'}`);
+        if (attempt < maxRetries && fillNumberResult?.retryWithAnotherPhone) {
+          await addLog(`步骤 8：当前手机号触发限制，正在更换新号码（${attempt + 1}/${maxRetries}）...`, 'warn');
+          continue;
         }
-
-        await requestHeroSmsActivationReady(latestState, activation.activationId);
-        activatedForSms = true;
-        await addLog('步骤 8：手机号已提交成功，正在等待 Hero SMS 返回验证码...', 'info');
-        await setState({
-          heroSmsPendingActivation: {
-            activationId: activation.activationId,
-            phoneNumber: activation.phoneNumber,
-            nationalNumber: activation.nationalNumber,
-            status: 'waiting_code',
-            startedAt: pollStartedAt,
-          },
-        });
+        throw new Error(`步骤 8：手机号被页面拒绝：${fillNumberResult.errorText || '号码被页面拒绝'}`);
       }
 
-      for (let pollAttempt = 1; pollAttempt <= pollMaxAttempts; pollAttempt++) {
+      await requestHeroSmsActivationReady(latestState, activation.activationId);
+      await addLog('步骤 8：手机号已提交成功，正在等待 Hero SMS 返回验证码...', 'info');
+
+      const pollStartedAt = Date.now();
+      while (Date.now() - pollStartedAt < HERO_SMS_STEP8_POLL_TIMEOUT_MS) {
         throwIfStopped();
-        if (Date.now() - pollStartedAt >= HERO_SMS_STEP8_POLL_TIMEOUT_MS) {
-          throw new Error('步骤 8：等待 Hero SMS 验证码超时（4 分 30 秒）。');
-        }
         const statusResult = await requestHeroSmsActivationStatus(latestState, activation.activationId);
 
         if (statusResult?.status === 'code_received' && statusResult.code) {
-          if (previousCode && statusResult.code === previousCode) {
-            if (pollAttempt < pollMaxAttempts) {
-              await sleepWithStop(pollIntervalMs);
-              continue;
-            }
-            throw new Error('步骤 8：Hero SMS 尚未返回新的短信验证码。');
-          }
-
           await addLog(`步骤 8：已收到 Hero SMS 验证码 ${statusResult.code}，准备自动提交...`, 'info');
           const fillCodeResult = await sendToContentScriptResilient('signup-page', {
             type: 'ADD_PHONE_FILL_CODE',
@@ -6613,14 +6515,11 @@ async function resolveStep8PhoneVerificationFlow(state, authState = {}) {
             throw new Error(fillCodeResult.error);
           }
           if (fillCodeResult?.invalidPhone) {
-            if (isReusedActivation) {
-              await setState({ heroSmsReusableActivation: null, heroSmsPendingActivation: null });
-            } else if (activation?.activationId && !activationCancelled) {
-              await requestHeroSmsActivationCancel(latestState, activation.activationId);
+            if (activation?.activationId && !activationCancelled) {
+              await requestHeroSmsActivationCancel(latestState, activation.activationId).catch(() => null);
               activationCancelled = true;
             }
             if (attempt < maxRetries && fillCodeResult?.retryWithAnotherPhone) {
-              await setState({ heroSmsPendingActivation: null });
               await addLog(`步骤 8：当前手机号触发限制，正在更换新号码（${attempt + 1}/${maxRetries}）...`, 'warn');
               continue;
             }
@@ -6630,65 +6529,43 @@ async function resolveStep8PhoneVerificationFlow(state, authState = {}) {
             throw new Error(`步骤 8：手机验证码被页面拒绝：${fillCodeResult.errorText || statusResult.code}`);
           }
 
-          const remainingUses = Math.max(
-            0,
-            (Number.isFinite(Number(activation.remainingUses)) ? Number(activation.remainingUses) : HERO_SMS_REUSE_MAX_USES) - 1
-          );
-          await setState({
-            heroSmsPendingActivation: null,
-            heroSmsReusableActivation: remainingUses > 0
-              ? {
-                activationId: activation.activationId,
-                phoneNumber: activation.phoneNumber,
-                nationalNumber: activation.nationalNumber,
-                remainingUses,
-                lastCode: statusResult.code,
-              }
-              : null,
-          });
-
-          await addLog(`步骤 8：手机号验证已通过，${remainingUses > 0 ? `当前号码剩余 ${remainingUses} 次可复用次数。` : '当前号码已用尽。'}`, 'ok');
+          await addLog('步骤 8：手机号验证已通过。', 'ok');
           return {
             ok: true,
             addPhonePage: true,
             activationId: activation.activationId,
             code: statusResult.code,
-            reusedActivation: isReusedActivation,
-            remainingPhoneUses: remainingUses,
           };
         }
 
         if (statusResult?.status === 'cancelled') {
-          await setState({ heroSmsPendingActivation: null });
           throw new Error('步骤 8：Hero SMS 激活已被取消。');
         }
 
-        if (pollAttempt < pollMaxAttempts) {
-          const remainingMs = HERO_SMS_STEP8_POLL_TIMEOUT_MS - (Date.now() - pollStartedAt);
-          if (remainingMs <= 0) {
-            throw new Error('步骤 8：等待 Hero SMS 验证码超时（4 分 30 秒）。');
-          }
-          await sleepWithStop(Math.min(pollIntervalMs, remainingMs));
+        const remainingMs = HERO_SMS_STEP8_POLL_TIMEOUT_MS - (Date.now() - pollStartedAt);
+        if (remainingMs <= 0) {
+          break;
         }
+        await sleepWithStop(Math.min(pollIntervalMs, remainingMs));
       }
 
-      throw new Error('步骤 8：等待 Hero SMS 验证码超时（4 分 30 秒）。');
-    } catch (err) {
-      if (isReusedActivation) {
-        await setState({ heroSmsReusableActivation: null, heroSmsPendingActivation: null });
+      if (activation?.activationId && !activationCancelled) {
+        await requestHeroSmsActivationCancel(latestState, activation.activationId).catch(() => null);
+        activationCancelled = true;
       }
-      if (!isReusedActivation && activation?.activationId && !activationCancelled && activatedForSms) {
+
+      if (attempt < maxRetries) {
+        await addLog(`步骤 8：等待验证码超时（2 分 30 秒），正在重新购买手机号（${attempt + 1}/${maxRetries}）...`, 'warn');
+        continue;
+      }
+
+      throw new Error('步骤 8：等待 Hero SMS 验证码超时（2 分 30 秒）。');
+    } catch (err) {
+      if (activation?.activationId && !activationCancelled) {
         try {
           await requestHeroSmsActivationCancel(latestState, activation.activationId);
         } catch {
         }
-        await setState({ heroSmsPendingActivation: null });
-      }
-      if (!isReusedActivation && (!activation || activationCancelled || !activatedForSms)) {
-        await setState({ heroSmsPendingActivation: null });
-      }
-      if (isReusedActivation && attempt < maxRetries) {
-        continue;
       }
       throw err;
     }
